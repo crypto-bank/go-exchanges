@@ -1,6 +1,7 @@
 package poloniex
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -20,6 +21,15 @@ type Stream struct {
 	client *turnpike.Client
 	events chan *orderbook.Event
 	errors chan error
+
+	// hbchan - heartbeat channel
+	hbchan chan interface{}
+
+	// subs - active subscriptions
+	subs []*currency.Pair
+
+	// timestamp - time of last event
+	timestamp time.Time
 }
 
 const (
@@ -32,25 +42,44 @@ const (
 
 // NewStream - Creates a new connected poloniex stream.
 func NewStream() (stream *Stream, err error) {
-	client, err := turnpike.NewWebsocketClient(turnpike.JSON, WebsocketAddress, nil)
-	if err != nil {
-		return
-	}
-
-	_, err = client.JoinRealm(WebsocketRealm, nil)
-	if err != nil {
-		return
-	}
-
-	return &Stream{
-		client: client,
+	stream = &Stream{
 		events: make(chan *orderbook.Event, 1000),
 		errors: make(chan error, 10),
-	}, nil
+		hbchan: make(chan interface{}, 1),
+	}
+	err = stream.connect()
+	if err != nil {
+		return
+	}
+	go stream.heartbeatPoll()
+	return
 }
 
-// Subscribe - Subscribes to currency pair order book.
+// connect - Connects to poloniex websocket server
+func (stream *Stream) connect() (err error) {
+	// Create WS client and connect
+	stream.client, err = turnpike.NewWebsocketClient(turnpike.JSON, WebsocketAddress, nil)
+	if err != nil {
+		return
+	}
+	// Join to poloniex realm
+	_, err = stream.client.JoinRealm(WebsocketRealm, nil)
+	return
+}
+
+// Subscribe - Sends subscription to the server.
+// Stores subscription pair in local memory,
+// in case of disconnection it will re-subscribe.
 func (stream *Stream) Subscribe(pair *currency.Pair) error {
+	// Add pair to local subscriptions map
+	// if disconnect happens we might have to reuse it
+	stream.subs = append(stream.subs, pair)
+	// Send subscription to the server
+	return stream.subscribe(pair)
+}
+
+// subscribe - Sends subscription to the server.
+func (stream *Stream) subscribe(pair *currency.Pair) error {
 	return stream.client.Subscribe(pair.Concat("_"), stream.eventHandler(pair))
 }
 
@@ -75,15 +104,28 @@ func (stream *Stream) Close() (err error) {
 	// It should be safe to close channels now
 	close(stream.errors)
 	close(stream.events)
+	close(stream.hbchan)
 	return
 }
 
 // eventHandler - Creates stream event handler for currency pair.
 func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 	return func(args []interface{}, kwargs map[string]interface{}) {
-		if len(args) == 0 {
-			glog.Info("HEARTBEAT")
+		// Send a heartbeat to a goroutine,
+		// which polls for it and re-connects in case of heartbeat stop.
+		stream.hbchan <- true
+
+		// If more than one argument is present
+		// it means we received an event.
+		// We have to store timestamp of last event,
+		// so in case no events in latest 60 seconds will be sent
+		// heartbeats will increase to 8 seconds (sent by Poloniex)
+		// and we won't reconnect.
+		if len(args) >= 1 {
+			stream.timestamp = time.Now()
 		}
+
+		// Parse and emit all events
 		for _, v := range args {
 			// Cast to underlying value type
 			value := v.(map[string]interface{})
@@ -103,6 +145,70 @@ func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 			}
 		}
 	}
+}
+
+// heartbeatPoll - Polls for heartbeats and re-connects in case of stop.
+// Should be executed in separate goroutine.
+func (stream *Stream) heartbeatPoll() {
+	for {
+		// Calculate heartbeat interval,
+		// adding one second in case of connection problems.
+		timeout := stream.heartbeatInterval() + time.Second
+
+		// Create a context with timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		// Poll on either a heartbeat or a timeout channel.
+		select {
+		case hb := <-stream.hbchan:
+			// If heartbeat is nil, it means heartbeat channel was closed
+			// and this goroutine should be garbage collected
+			if hb == nil {
+				return
+			}
+		case <-ctx.Done():
+			// Timeout passed for a heartbeat to arrive.
+			// Warn about reconnecting and start the process.
+			glog.Warningf("No heartbeat received for %s, reconnecting.", timeout)
+			// Start reconnecting to websocket
+			stream.startReconnecting()
+			// Re-subscribe after re-connection
+			stream.resubscribe()
+		}
+	}
+}
+
+func (stream *Stream) startReconnecting() {
+	for range time.Tick(time.Millisecond * 250) {
+		// Connect to websocket
+		err := stream.connect()
+		if err != nil {
+			glog.Warningf("Re-connect error: %v", err)
+			continue
+		}
+		// Stop re-connecting
+		break
+	}
+}
+
+func (stream *Stream) heartbeatInterval() time.Duration {
+	if time.Since(stream.timestamp) > time.Minute {
+		return time.Second * 8
+	}
+	return time.Second
+
+}
+
+// resubscribe - Re-subscribes client after re-connection.
+func (stream *Stream) resubscribe() (err error) {
+	for _, pair := range stream.subs {
+		err = stream.subscribe(pair)
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 var handlers = map[string]func(*currency.Pair, map[string]interface{}) (*orderbook.Event, error){
