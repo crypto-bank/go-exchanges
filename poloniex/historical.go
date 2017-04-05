@@ -3,70 +3,32 @@ package poloniex
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/k0kubun/pp"
+	"github.com/gogo/protobuf/types"
 	"golang.org/x/net/context/ctxhttp"
 
+	"github.com/crypto-bank/go-exchanges/common"
 	"github.com/crypto-bank/proto/currency"
+	"github.com/crypto-bank/proto/exchange"
+	"github.com/crypto-bank/proto/order"
 )
 
-func main() {
-	flag.CommandLine.Parse([]string{"-logtostderr"})
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*15)
-	defer cancel()
-
-	req := &tradesRequest{
-		Pair:  currency.NewPair("BTC", "XRP"),
-		Start: time.Now().Add(-time.Hour * 24),
-		End:   time.Now(),
-	}
-
-	// Create response channel
-	results := make(chan []*historicalTrade, 1)
-
-	// Get all trades in goroutine
-	go func() {
-		if err := getAllTrades(ctx, req, results); err != nil {
-			glog.Fatal(err)
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != nil {
-				glog.Fatal(err)
-			}
-			break
-		case trades := <-results:
-			pp.Println(trades[:10])
-			return
-		}
-	}
-}
-
-type historicalTrade struct {
-	GlobalTradeID int    `json:"globalTradeID"`
-	TradeID       int    `json:"tradeID"`
-	Date          string `json:"date"`
-	Type          string `json:"type"`
-	Rate          string `json:"rate"`
-	Amount        string `json:"amount"`
-	Total         string `json:"total"`
-}
-
-type tradesRequest struct {
+// HistoryRequest - Trades history request.
+type HistoryRequest struct {
 	Pair  *currency.Pair
 	Start time.Time
 	End   time.Time
 }
 
-func getAllTrades(ctx context.Context, req *tradesRequest, results chan<- []*historicalTrade) (err error) {
+// History - Reads trades history from start to end.
+// Results channel will be closed by this function.
+func History(ctx context.Context, req HistoryRequest, results chan<- []*order.Trade) (err error) {
+	defer func() {
+		close(results)
+	}()
+
 	for {
 		// Pass in case context is done
 		select {
@@ -96,21 +58,15 @@ func getAllTrades(ctx context.Context, req *tradesRequest, results chan<- []*his
 			last := trades[len(trades)-1]
 			// Parse last trade time
 			// and set start to last trade time
-			start, err := time.Parse("2006-01-02 15:04:05", last.Date)
+			req.Start, err = types.TimestampFromProto(last.Time)
 			if err != nil {
 				return err
-			}
-			// Set next request
-			req = &tradesRequest{
-				Pair:  req.Pair,
-				Start: start,
-				End:   req.End,
 			}
 		}
 	}
 }
 
-func getTrades(ctx context.Context, req *tradesRequest) (trades []*historicalTrade, err error) {
+func getTrades(ctx context.Context, req HistoryRequest) (trades []*order.Trade, err error) {
 	// Construct historical data URL
 	dataURL := fmt.Sprintf(
 		"https://poloniex.com/public?command=returnTradeHistory&currencyPair=%s&start=%d&end=%d",
@@ -127,6 +83,58 @@ func getTrades(ctx context.Context, req *tradesRequest) (trades []*historicalTra
 	defer resp.Body.Close()
 
 	// Unmarshal response
-	err = json.NewDecoder(resp.Body).Decode(&trades)
+	var data []*historicalTrade
+	err = json.NewDecoder(resp.Body).Decode(&data)
+	if err != nil {
+		return
+	}
+
+	return tradesFromHistory(req.Pair, data)
+}
+
+func tradesFromHistory(pair *currency.Pair, history []*historicalTrade) (res []*order.Trade, err error) {
+	res = make([]*order.Trade, len(history))
+	for i, item := range history {
+		res[i], err = tradeFromHistory(pair, item)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+type historicalTrade struct {
+	GlobalTradeID int    `json:"globalTradeID"`
+	TradeID       int    `json:"tradeID"`
+	Date          string `json:"date"`
+	Type          string `json:"type"`
+	Rate          string `json:"rate"`
+	Amount        string `json:"amount"`
+	Total         string `json:"total"`
+}
+
+func tradeFromHistory(pair *currency.Pair, trade *historicalTrade) (res *order.Trade, err error) {
+	res = &order.Trade{
+		ID: int64(trade.TradeID),
+		Order: &order.Order{
+			Exchange: exchange.Poloniex,
+		},
+	}
+	res.Order.Type, err = order.TypeFromString(trade.Type)
+	if err != nil {
+		return
+	}
+	res.Order.Rate, err = common.ParseIVolume(pair.First, trade.Rate)
+	if err != nil {
+		return
+	}
+	res.Order.Volume, err = common.ParseIVolume(pair.Second, trade.Amount)
+	if err != nil {
+		return
+	}
+	res.Time, err = common.ParseTime("2006-01-02 15:04:05", trade.Date)
+	if err != nil {
+		return
+	}
 	return
 }
