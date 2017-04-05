@@ -2,6 +2,9 @@ package common
 
 import (
 	"strconv"
+	"time"
+
+	"github.com/gogo/protobuf/types"
 
 	"github.com/crypto-bank/proto/currency"
 )
@@ -26,4 +29,14 @@ func ParseIVolume(cur *currency.Currency, i interface{}) (_ *currency.Volume, er
 		Amount:   amount,
 		Currency: cur,
 	}, nil
+}
+
+// ParseTime - Parses time into a timestamp.
+func ParseTime(format, s string) (res *types.Timestamp, err error) {
+	t, err := time.Parse(format, s)
+	if err != nil {
+		return
+	}
+	res, err = types.TimestampProto(t)
+	return
 }
