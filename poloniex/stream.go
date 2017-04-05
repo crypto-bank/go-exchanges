@@ -1,7 +1,6 @@
 package poloniex
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -23,7 +22,7 @@ type Stream struct {
 	errors chan error
 
 	// hbchan - heartbeat channel
-	hbchan chan interface{}
+	hbchan chan struct{}
 
 	// subs - active subscriptions
 	subs []*currency.Pair
@@ -42,28 +41,32 @@ const (
 
 // NewStream - Creates a new connected poloniex stream.
 func NewStream() (stream *Stream, err error) {
-	stream = &Stream{
-		events: make(chan *orderbook.Event, 1000),
-		errors: make(chan error, 10),
-		hbchan: make(chan interface{}, 1),
-	}
-	err = stream.connect()
+	client, err := connectWS()
 	if err != nil {
 		return
+	}
+	stream = &Stream{
+		client: client,
+		events: make(chan *orderbook.Event, 1000),
+		errors: make(chan error, 10),
+		hbchan: make(chan struct{}, 10),
 	}
 	go stream.heartbeatPoll()
 	return
 }
 
 // connect - Connects to poloniex websocket server
-func (stream *Stream) connect() (err error) {
+func connectWS() (client *turnpike.Client, err error) {
 	// Create WS client and connect
-	stream.client, err = turnpike.NewWebsocketClient(turnpike.JSON, WebsocketAddress, nil)
+	client, err = turnpike.NewWebsocketClient(turnpike.JSON, WebsocketAddress, nil)
 	if err != nil {
 		return
 	}
 	// Join to poloniex realm
-	_, err = stream.client.JoinRealm(WebsocketRealm, nil)
+	_, err = client.JoinRealm(WebsocketRealm, nil)
+	if err != nil {
+		return nil, err
+	}
 	return
 }
 
@@ -113,7 +116,7 @@ func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 	return func(args []interface{}, kwargs map[string]interface{}) {
 		// Send a heartbeat to a goroutine,
 		// which polls for it and re-connects in case of heartbeat stop.
-		stream.hbchan <- true
+		stream.hbchan <- struct{}{}
 
 		// If more than one argument is present
 		// it means we received an event.
@@ -155,41 +158,100 @@ func (stream *Stream) heartbeatPoll() {
 		// adding one second in case of connection problems.
 		timeout := stream.heartbeatInterval() + time.Second
 
-		// Create a context with timeout.
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
 		// Poll on either a heartbeat or a timeout channel.
 		select {
-		case hb := <-stream.hbchan:
-			// If heartbeat is nil, it means heartbeat channel was closed
+		case _, ok := <-stream.hbchan:
+			// If ok is false, it means heartbeat channel was closed
 			// and this goroutine should be garbage collected
-			if hb == nil {
+			if !ok {
 				return
 			}
-		case <-ctx.Done():
+		case <-time.After(timeout):
 			// Timeout passed for a heartbeat to arrive.
 			// Warn about reconnecting and start the process.
 			glog.Warningf("No heartbeat received for %s, reconnecting.", timeout)
 			// Start reconnecting to websocket
-			stream.startReconnecting()
-			// Re-subscribe after re-connection
-			stream.resubscribe()
+			stream.reconnect()
 		}
 	}
 }
 
-func (stream *Stream) startReconnecting() {
-	for range time.Tick(time.Millisecond * 250) {
-		// Connect to websocket
-		err := stream.connect()
-		if err != nil {
-			glog.Warningf("Re-connect error: %v", err)
-			continue
+func (stream *Stream) reconnect() {
+	// Channel on which event will be sent if we are done connecting
+	done := make(chan struct{}, 2)
+	result := make(chan *turnpike.Client, 1)
+
+	// Defer closing of the channels
+	defer func() {
+		close(done)
+		close(result)
+	}()
+
+	// Start re-connecting in goroutine
+	go func() {
+		for {
+			glog.V(1).Info("Re-connecting to poloniex")
+
+			// Connect to websocket
+			client, err := connectWS()
+			if err != nil {
+				glog.Warningf("Re-connect error: %v", err)
+				stream.errors <- err
+			} else {
+				glog.V(1).Info("Re-connected successfuly")
+				result <- client
+				return
+			}
+
+			select {
+			case <-time.After(time.Millisecond * 250):
+				continue
+			case <-done:
+				// If we receive on `done` channel
+				// it means we have received heartbeat before
+				// if we've got a client we have to close it
+				if client != nil {
+					glog.V(1).Info("Closing re-connected client")
+					client.Close()
+				}
+			}
 		}
-		// Stop re-connecting
-		break
+	}()
+
+	select {
+	case hb, ok := <-stream.hbchan:
+		glog.V(1).Info("Heartbeat restored before re-connect")
+		// Send event telling we are done connecting
+		done <- struct{}{}
+		// If ok is false, it means heartbeat channel was closed
+		// and this goroutine should be garbage collected
+		if !ok {
+			return
+		}
+		// Re-send heartbeat on the channel
+		stream.hbchan <- hb
+		// Try to read from result channel
+		if client, ok := <-result; ok {
+			glog.V(1).Info("Closing re-connected client")
+			// Close client, it won't be used anymore
+			client.Close()
+		}
+		return
+	case client := <-result:
+		glog.V(1).Info("Replacing old client")
+		// First we have to close old client
+		if err := stream.client.Close(); err != nil {
+			glog.Warningf("Client close error: %v", err)
+			stream.errors <- err
+		}
+
+		// now we can replace it with new client
+		stream.client = client
 	}
+
+	// Re-subscribe after re-connection
+	glog.V(1).Infof("Re-subscribing to %d channels", len(stream.subs))
+	stream.resubscribe()
 }
 
 func (stream *Stream) heartbeatInterval() time.Duration {
