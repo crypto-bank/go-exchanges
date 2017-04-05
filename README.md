@@ -4,12 +4,21 @@
 
 Golang client for cryptocurrency exchanges.
 
+## Support
+
+Currently only [Poloniex](https://poloniex.com/) exchange is supported but contributions are welcome.
+
 ## Exchanges
 
 | Exchange | Stream | REST | Planned |
 | -------- | ------ | ---- | ------- |
 | Poloniex | ✓      | ✗    |         |
+| GDAX     | ✗      | ✗    | ✓       |
 | Bitfinex | trades | ✗    | ✓       |
+
+## Streaming
+
+Streaming clients should be always self-healing and rely on heartbeats to indicate state of connection.
 
 ## License
 
