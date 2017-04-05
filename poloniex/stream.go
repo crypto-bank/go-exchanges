@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/beatgammit/turnpike"
-	"github.com/gogo/protobuf/types"
 	"github.com/golang/glog"
 
 	"github.com/crypto-bank/go-exchanges/common"
@@ -48,8 +47,8 @@ func NewStream() (stream *Stream, err error) {
 	stream = &Stream{
 		client: client,
 		events: make(chan *orderbook.Event, 1000),
-		errors: make(chan error, 10),
-		hbchan: make(chan struct{}, 10),
+		errors: make(chan error, 1000),
+		hbchan: make(chan struct{}, 1000),
 	}
 	go stream.heartbeatPoll()
 	return
@@ -128,6 +127,16 @@ func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 			stream.timestamp = time.Now()
 		}
 
+		// If no sequence ID we are not having the right thing
+		fseq, ok := kwargs["seq"].(float64)
+		if !ok {
+			glog.Warningf("No sequence number in kwargs")
+			return
+		}
+
+		// Convert `float64` sequence ID to `int64`
+		seq := int64(fseq)
+
 		// Parse and emit all events
 		for _, v := range args {
 			// Cast to underlying value type
@@ -140,7 +149,7 @@ func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 			data := value["data"].(map[string]interface{})
 
 			// Handle message
-			res, err := parseEvent(typ, pair, data)
+			res, err := parseEvent(typ, seq, pair, data)
 			if err != nil {
 				stream.errors <- fmt.Errorf("unhandled poloniex message: %v", err)
 			} else {
@@ -155,8 +164,8 @@ func (stream *Stream) eventHandler(pair *currency.Pair) turnpike.EventHandler {
 func (stream *Stream) heartbeatPoll() {
 	for {
 		// Calculate heartbeat interval,
-		// adding one second in case of connection problems.
-		timeout := stream.heartbeatInterval() + time.Second
+		// adding two seconds in case of connection problems.
+		timeout := stream.heartbeatInterval() + (2 * time.Second)
 
 		// Poll on either a heartbeat or a timeout channel.
 		select {
@@ -220,12 +229,13 @@ func (stream *Stream) reconnect() {
 
 	select {
 	case hb, ok := <-stream.hbchan:
-		glog.V(1).Info("Heartbeat restored before re-connect")
+		glog.V(1).Infof("Heartbeat restored before re-connect (state: %v)", ok)
 		// Send event telling we are done connecting
 		done <- struct{}{}
 		// If ok is false, it means heartbeat channel was closed
 		// and this goroutine should be garbage collected
 		if !ok {
+			glog.V(1).Info("Closing re-connected client")
 			return
 		}
 		// Re-send heartbeat on the channel
@@ -235,6 +245,8 @@ func (stream *Stream) reconnect() {
 			glog.V(1).Info("Closing re-connected client")
 			// Close client, it won't be used anymore
 			client.Close()
+		} else {
+			glog.V(1).Info("Re-connected client was not recovered")
 		}
 		return
 	case client := <-result:
@@ -273,13 +285,13 @@ func (stream *Stream) resubscribe() (err error) {
 	return
 }
 
-var handlers = map[string]func(*currency.Pair, map[string]interface{}) (*orderbook.Event, error){
+var handlers = map[string]func(int64, *currency.Pair, map[string]interface{}) (*orderbook.Event, error){
 	"orderBookRemove": parseRemove,
 	"orderBookModify": parseModify,
 	"newTrade":        parseTrade,
 }
 
-func parseEvent(typ string, pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
+func parseEvent(typ string, seq int64, pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
 	// Get handler by message type
 	handler, ok := handlers[typ]
 	if !ok {
@@ -287,10 +299,10 @@ func parseEvent(typ string, pair *currency.Pair, data map[string]interface{}) (_
 	}
 
 	// Handle message
-	return handler(pair, data)
+	return handler(seq, pair, data)
 }
 
-func parseRemove(pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
+func parseRemove(seq int64, pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
 	res := &order.Order{
 		Exchange: exchange.Poloniex,
 		Volume:   currency.NewVolume(pair.Second, 0.0),
@@ -303,10 +315,10 @@ func parseRemove(pair *currency.Pair, data map[string]interface{}) (_ *orderbook
 	if err != nil {
 		return
 	}
-	return orderbook.NewEvent(res), nil
+	return orderbook.NewEvent(seq, res), nil
 }
 
-func parseModify(pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
+func parseModify(seq int64, pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
 	res := &order.Order{
 		Exchange: exchange.Poloniex,
 	}
@@ -322,20 +334,16 @@ func parseModify(pair *currency.Pair, data map[string]interface{}) (_ *orderbook
 	if err != nil {
 		return
 	}
-	return orderbook.NewEvent(res), nil
+	return orderbook.NewEvent(seq, res), nil
 }
 
-func parseTrade(pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
+func parseTrade(seq int64, pair *currency.Pair, data map[string]interface{}) (_ *orderbook.Event, err error) {
 	res := new(order.Trade)
 	res.ID, err = common.ParseIInt64(data["tradeID"])
 	if err != nil {
 		return
 	}
-	t, err := time.Parse("2006-01-02 15:04:05", data["date"].(string))
-	if err != nil {
-		return
-	}
-	res.Time, err = types.TimestampProto(t)
+	res.Time, err = common.ParseTime("2006-01-02 15:04:05", data["date"].(string))
 	if err != nil {
 		return
 	}
@@ -354,5 +362,5 @@ func parseTrade(pair *currency.Pair, data map[string]interface{}) (_ *orderbook.
 	if err != nil {
 		return
 	}
-	return orderbook.NewEvent(res), nil
+	return orderbook.NewEvent(seq, res), nil
 }
