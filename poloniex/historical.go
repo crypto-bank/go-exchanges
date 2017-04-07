@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/types"
+	"github.com/golang/glog"
 	"golang.org/x/net/context/ctxhttp"
 
 	"github.com/crypto-bank/go-exchanges/common"
@@ -25,9 +26,15 @@ type HistoryRequest struct {
 // History - Reads trades history from start to end.
 // Results channel will be closed by this function.
 func History(ctx context.Context, req HistoryRequest, results chan<- []*order.Trade) (err error) {
-	defer func() {
-		close(results)
-	}()
+	// Begin a year ago, not before
+	if lastYear := time.Now().Add(-time.Hour * 24 * 365); req.Start.Before(lastYear) {
+		req.Start = lastYear
+	}
+
+	// Set `End` to now if it is zero
+	if req.End.Unix() == 0 {
+		req.End = time.Now()
+	}
 
 	for {
 		// Pass in case context is done
@@ -53,15 +60,19 @@ func History(ctx context.Context, req HistoryRequest, results chan<- []*order.Tr
 
 		// If reached max amount in one request
 		// We will start from last trade in list
-		if len(trades) >= 50000 {
+		if len(trades) >= 1 {
 			// Get last trade
 			last := trades[len(trades)-1]
-			// Parse last trade time
-			// and set start to last trade time
-			req.Start, err = types.TimestampFromProto(last.Time)
+			// Set last trade time as request end
+			req.End, err = types.TimestampFromProto(last.Time)
 			if err != nil {
 				return err
 			}
+		}
+
+		// Break if less than 50k results were returned
+		if len(trades) < 50000 {
+			return nil
 		}
 	}
 }
@@ -74,6 +85,8 @@ func getTrades(ctx context.Context, req HistoryRequest) (trades []*order.Trade, 
 		req.Start.Unix(),
 		req.End.Unix(),
 	)
+
+	glog.V(2).Infof("Requesting poloniex history %s to %s", req.Start, req.End)
 
 	// Request HTTP URL to get data
 	resp, err := ctxhttp.Get(ctx, nil, dataURL)
